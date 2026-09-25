@@ -1,0 +1,18 @@
+body { background: #f4f6f9; }
+.sidebar { width: 240px; min-height: 100vh; position: sticky; top: 0; }
+.sidebar .brand { font-size: 1.05rem; font-weight: 600; }
+.sidebar .nav-link { color: #cfd4da; border-radius: .375rem; }
+.sidebar .nav-link:hover, .sidebar .nav-link.active { background: #2c3440; color: #fff; }
+.content { min-height: 100vh; max-width: calc(100% - 240px); }
+.stat-card .value { font-size: 1.7rem; font-weight: 600; }
+.invoice-doc { background: #fff; padding: 2rem; max-width: 900px; }
+.invoice-doc h4 { margin: 0; }
+.invoice-doc table td, .invoice-doc table th { font-size: .9rem; }
+.text-ar { direction: rtl; font-family: "Segoe UI", Tahoma, sans-serif; }
+#lines input.form-control, #lines select.form-select { font-size: .875rem; }
+@media print {
+  body { background: #fff; }
+  .sidebar, .d-print-none { display: none !important; }
+  .content { max-width: 100%; padding: 0 !important; }
+  .invoice-doc { padding: 0; max-width: 100%; }
+}
