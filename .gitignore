@@ -1,0 +1,3 @@
+# Encryption key for stored secrets, and server-specific settings: never commit these
+/storage/
+/config.local.php

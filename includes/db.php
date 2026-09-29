@@ -6,9 +6,17 @@ function db(): PDO
     static $pdo = null;
     if ($pdo) return $pdo;
     $opts = [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC];
-    $root = new PDO('mysql:host=' . DB_HOST . ';charset=utf8mb4', DB_USER, DB_PASS, $opts);
-    $root->exec('CREATE DATABASE IF NOT EXISTS `' . DB_NAME . '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
-    $pdo = new PDO('mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4', DB_USER, DB_PASS, $opts);
+    $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+    try {
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $opts);
+    } catch (PDOException $e) {
+        // Error 1049 = database does not exist. Create it where the account is allowed to (local development);
+        // on shared hosting the database is created in the hosting panel and this branch is never reached.
+        if ((int)($e->errorInfo[1] ?? 0) !== 1049) throw $e;
+        $root = new PDO('mysql:host=' . DB_HOST . ';charset=utf8mb4', DB_USER, DB_PASS, $opts);
+        $root->exec('CREATE DATABASE IF NOT EXISTS `' . DB_NAME . '` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $opts);
+    }
     migrate($pdo);
     return $pdo;
 }
@@ -105,6 +113,24 @@ function migrate(PDO $pdo): void
         user_id INT NULL,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     )");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS zatca_logs (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        invoice_id INT NULL,
+        invoice_number VARCHAR(64) NULL,
+        action VARCHAR(32) NOT NULL,
+        environment VARCHAR(16) NULL,
+        endpoint VARCHAR(255) NULL,
+        http_status INT NULL,
+        result ENUM('success','warning','error','not_sent') NOT NULL,
+        zatca_status VARCHAR(32) NULL,
+        message TEXT NULL,
+        request_body LONGTEXT NULL,
+        response_body LONGTEXT NULL,
+        duration_ms INT NULL,
+        user_id INT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX (invoice_id), INDEX (created_at)
+    )");
     if ((int)$pdo->query("SELECT COUNT(*) FROM egs_units")->fetchColumn() === 0) {
         $pdo->prepare("INSERT INTO egs_units (name, last_hash) VALUES ('Main Unit', ?)")
             ->execute(['NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==']);
@@ -113,18 +139,27 @@ function migrate(PDO $pdo): void
 
 function setting(string $key, $default = ''): string
 {
-    static $cache = null;
-    if ($cache === null) {
-        $cache = [];
-        foreach (db()->query("SELECT `key`, `value` FROM settings") as $r) $cache[$r['key']] = (string)$r['value'];
+    if (!isset($GLOBALS['settings_cache'])) {
+        $GLOBALS['settings_cache'] = [];
+        foreach (db()->query("SELECT `key`, `value` FROM settings") as $r) $GLOBALS['settings_cache'][$r['key']] = (string)$r['value'];
     }
-    return $cache[$key] ?? (string)$default;
+    $v = $GLOBALS['settings_cache'][$key] ?? '';
+    return $v !== '' ? $v : (string)$default;
 }
 
 function save_settings(array $pairs): void
 {
     $st = db()->prepare("INSERT INTO settings (`key`, `value`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `value` = VALUES(`value`)");
     foreach ($pairs as $k => $v) $st->execute([$k, $v]);
+    unset($GLOBALS['settings_cache']);
+}
+
+function zatca_log(array $e): void
+{
+    $cols = ['invoice_id', 'invoice_number', 'action', 'environment', 'endpoint', 'http_status', 'result', 'zatca_status', 'message', 'request_body', 'response_body', 'duration_ms'];
+    $vals = array_map(fn($c) => $e[$c] ?? null, $cols);
+    $vals[] = $_SESSION['user_id'] ?? null;
+    db()->prepare("INSERT INTO zatca_logs (" . implode(',', $cols) . ", user_id) VALUES (" . str_repeat('?,', count($cols)) . "?)")->execute($vals);
 }
 
 function audit(string $event, $details = null): void

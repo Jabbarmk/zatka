@@ -5,7 +5,9 @@
  * the CSID certificate is issued — see zatca.php (integration settings).
  */
 
-const PIH_INITIAL = 'NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==';
+require_once __DIR__ . '/zatca_crypto.php';
+
+const PIH_INITIAL ='NWZlY2ViNjZmZmM4NmYzOGQ5NTI3ODZjNmQ2OTZjNzljMmRiYzIzOWRkNGU5MWI0NjcyOWQ3M2EyN2ZiNTdlOQ==';
 
 const VAT_CATEGORIES = ['S' => 'Standard rate', 'Z' => 'Zero rated', 'E' => 'Exempt', 'O' => 'Out of scope'];
 
@@ -116,40 +118,49 @@ function qr_tlv(array $tags): string
     return base64_encode($out);
 }
 
-function build_qr(array $inv, array $seller, string $invoiceHash): string
+function qr_decode(string $base64): array
 {
-    return qr_tlv([
+    $b = base64_decode($base64); $tags = []; $i = 0;
+    while ($i + 2 <= strlen($b)) { $len = ord($b[$i + 1]); $tags[ord($b[$i])] = substr($b, $i + 2, $len); $i += 2 + $len; }
+    return $tags;
+}
+
+/** QR tags 1-5. Tag 6 (hash) and tags 7-9 (signature, public key, CA stamp) are added when hashing / signing. */
+function qr_base_tags(array $inv, array $seller): array
+{
+    return [
         1 => $seller['seller_name'],
         2 => $seller['seller_vat'],
-        3 => $inv['issue_date'] . 'T' . $inv['issue_time'] . 'Z',
+        3 => $inv['issue_date'] . 'T' . $inv['issue_time'],
         4 => money($inv['grand_total']),
         5 => money($inv['vat_total']),
-        6 => $invoiceHash,
-        // Tags 7-9 (signature, public key, CA stamp) are added once the CSID certificate is installed.
-    ]);
+    ];
 }
 
 /** Hash per BR-KSA-26: strip UBLExtensions, cac:Signature, QR reference → C14N → SHA-256 → base64. */
-function invoice_hash(string $xml): string
+function invoice_hash_raw(string $xml): string
 {
+    // Whitespace is preserved: the ZATCA transform removes only the elements, not the text around them.
     $dom = new DOMDocument();
-    $dom->preserveWhiteSpace = false;
     $dom->loadXML($xml);
     $xp = new DOMXPath($dom);
-    $xp->registerNamespace('cac', 'urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2');
-    $xp->registerNamespace('cbc', 'urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2');
-    $xp->registerNamespace('ext', 'urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2');
-    foreach (['//ext:UBLExtensions', '//cac:Signature', "//cac:AdditionalDocumentReference[cbc:ID='QR']"] as $q) {
-        foreach ($xp->query($q) as $n) $n->parentNode->removeChild($n);
+    $xp->registerNamespace("cac", "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2");
+    $xp->registerNamespace("cbc", "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2");
+    $xp->registerNamespace("ext", "urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2");
+    foreach (["//ext:UBLExtensions", "//cac:Signature", "//cac:AdditionalDocumentReference[cbc:ID='QR']"] as $q) {
+        foreach (iterator_to_array($xp->query($q)) as $n) $n->parentNode->removeChild($n);
     }
-    // NOTE: PHP's DOM offers C14N 1.0; ZATCA specifies C14N 1.1. They are equivalent for this document
-    // shape (no xml:base / relative namespaces). Swap in a C14N11 implementation when signing is added.
-    $canon = $dom->C14N(false, false);
-    return base64_encode(hash('sha256', $canon, true));
+    // PHP offers C14N 1.0; it is identical to C14N 1.1 for documents without xml:id / xml:base attributes.
+    return hash("sha256", $dom->C14N(false, false), true);
 }
 
-/** Build UBL 2.1 Invoice XML. $qr = null → no QR element (used for hashing). */
-function build_ubl(array $inv, array $lines, array $totals, array $seller, ?array $customer, ?string $qr): string
+function invoice_hash(string $xml): string
+{
+    return base64_encode(invoice_hash_raw($xml));
+}
+
+/** Build the unsigned UBL 2.1 Invoice XML. Signature elements are added by zatca_sign_document(). */
+function build_ubl(array $inv, array $lines, array $totals, array $seller, ?array $customer, string $qr): string
 {
     $cur = $inv['currency'];
     $isStandard = $inv['subtype'] === '01';
@@ -169,9 +180,9 @@ function build_ubl(array $inv, array $lines, array $totals, array $seller, ?arra
     }
     $x .= "  <cac:AdditionalDocumentReference>\n    <cbc:ID>ICV</cbc:ID>\n    <cbc:UUID>" . (int)$inv['icv'] . "</cbc:UUID>\n  </cac:AdditionalDocumentReference>\n";
     $x .= "  <cac:AdditionalDocumentReference>\n    <cbc:ID>PIH</cbc:ID>\n    <cac:Attachment>\n      <cbc:EmbeddedDocumentBinaryObject mimeCode=\"text/plain\">" . xe($inv['previous_hash']) . "</cbc:EmbeddedDocumentBinaryObject>\n    </cac:Attachment>\n  </cac:AdditionalDocumentReference>\n";
-    if ($qr !== null) {
-        $x .= "  <cac:AdditionalDocumentReference>\n    <cbc:ID>QR</cbc:ID>\n    <cac:Attachment>\n      <cbc:EmbeddedDocumentBinaryObject mimeCode=\"text/plain\">" . xe($qr) . "</cbc:EmbeddedDocumentBinaryObject>\n    </cac:Attachment>\n  </cac:AdditionalDocumentReference>\n";
-    }
+    // The QR element is excluded from the invoice hash. It carries no whitespace of its own, so the hash
+    // stays the same when the QR value changes or when the signature elements are inserted next to it.
+    $x .= "<cac:AdditionalDocumentReference>\n    <cbc:ID>QR</cbc:ID>\n    <cac:Attachment>\n      <cbc:EmbeddedDocumentBinaryObject mimeCode=\"text/plain\">" . xe($qr) . "</cbc:EmbeddedDocumentBinaryObject>\n    </cac:Attachment>\n  </cac:AdditionalDocumentReference>";
     // Seller
     $x .= "  <cac:AccountingSupplierParty>\n    <cac:Party>\n";
     $x .= "      <cac:PartyIdentification>\n        <cbc:ID schemeID=\"" . xe($seller['seller_id_scheme'] ?: 'CRN') . "\">" . xe($seller['seller_id_value']) . "</cbc:ID>\n      </cac:PartyIdentification>\n";
@@ -256,6 +267,81 @@ function address_xml($street, $building, $district, $city, $postal, $country, $a
     if ($province) $x .= "        <cbc:CountrySubentity>" . xe($province) . "</cbc:CountrySubentity>\n";
     $x .= "        <cac:Country>\n          <cbc:IdentificationCode>" . xe($country) . "</cbc:IdentificationCode>\n        </cac:Country>\n      </cac:PostalAddress>\n";
     return $x;
+}
+
+/**
+ * Submit a document to ZATCA (clearance for standard, reporting for simplified) and log the outcome.
+ * Every attempt is written to zatca_logs, including attempts blocked by missing configuration.
+ */
+function zatca_submit_invoice(array $inv): array
+{
+    $action = $inv['subtype'] === '02' ? 'reporting' : 'clearance';
+    $env = setting('zatca_env', 'sandbox');
+    $log = ['invoice_id' => $inv['id'], 'invoice_number' => $inv['invoice_number'], 'action' => $action, 'environment' => $env];
+    $notSent = function (string $msg) use ($log) {
+        zatca_log($log + ['result' => 'not_sent', 'message' => $msg]);
+        return ['result' => 'not_sent', 'message' => $msg];
+    };
+    if (in_array($inv['zatca_status'], ['cleared', 'reported'], true)) return $notSent('Not sent: this document was already accepted by ZATCA.');
+
+    $cert = setting('zatca_production_cert');
+    $secret = secret_setting('zatca_production_secret');
+    $base = zatca_base_url();
+    $missing = [];
+    if (setting('zatca_enabled') !== '1') $missing[] = 'integration is disabled';
+    if ($cert === '') $missing[] = 'production CSID is missing';
+    if ($secret === '') $missing[] = 'production secret is missing';
+    if ($missing) return $notSent('Not sent: ' . implode(', ', $missing) . '.');
+
+    // Documents issued before the certificate was installed are signed now; the invoice hash does not change.
+    if (!str_contains($inv['xml'], '<ds:Signature')) {
+        try {
+            $signed = zatca_sign_with_settings($inv['xml'], $inv['subtype'] === '02');
+            if ($signed['hash'] !== $inv['invoice_hash']) throw new RuntimeException('hash changed after signing');
+        } catch (Throwable $e) {
+            return $notSent('Not sent: the document could not be signed (' . $e->getMessage() . ').');
+        }
+        db()->prepare("UPDATE invoices SET xml = ?, qr_base64 = ? WHERE id = ?")->execute([$signed['xml'], $signed['qr'], $inv['id']]);
+        $inv['xml'] = $signed['xml'];
+    }
+
+    $endpoint = $base . '/invoices/' . $action . '/single';
+    $body = ['invoiceHash' => $inv['invoice_hash'], 'uuid' => $inv['uuid'], 'invoice' => base64_encode($inv['xml'])];
+    $r = zatca_http('POST', $endpoint, $body, ['Clearance-Status: ' . ($action === 'clearance' ? '1' : '0')], [$cert, $secret]);
+
+    $json = $r['json'];
+    $zStatus = $json['clearanceStatus'] ?? $json['reportingStatus'] ?? null;
+    $msgs = zatca_messages($json);
+    $accepted = $action === 'clearance' ? 'cleared' : 'reported';
+    if ($r['body'] === null) { $result = 'error'; $status = 'failed'; $msgs[] = 'Connection error: ' . $r['error']; }
+    elseif ($r['http'] === 200) { $result = 'success'; $status = $accepted; }
+    elseif ($r['http'] === 202) { $result = 'warning'; $status = $accepted; }
+    elseif ($r['http'] === 400) { $result = 'error'; $status = 'rejected'; }
+    else { $result = 'error'; $status = 'failed'; if (!$msgs) $msgs[] = 'HTTP ' . $r['http']; }
+    $message = $msgs ? implode("\n", $msgs) : ($zStatus ?: 'OK');
+
+    $body['invoice'] = '[base64 XML, ' . strlen($body['invoice']) . ' chars]';
+    zatca_log($log + [
+        'endpoint' => $endpoint, 'http_status' => $r['http'] ?: null, 'result' => $result, 'zatca_status' => $zStatus, 'message' => $message,
+        'request_body' => json_encode($body, JSON_PRETTY_PRINT), 'response_body' => $r['body'], 'duration_ms' => $r['ms'],
+    ]);
+    db()->prepare("UPDATE invoices SET zatca_status = ?, zatca_response = ?, submitted_at = NOW() WHERE id = ?")
+        ->execute([$status, $r['body'] ?? $message, $inv['id']]);
+
+    // Clearance returns the invoice stamped by ZATCA: that version (and its QR) is the one given to the buyer.
+    if ($status === 'cleared' && !empty($json['clearedInvoice'])) {
+        $cleared = base64_decode($json['clearedInvoice']);
+        if (preg_match('#<cbc:ID>QR</cbc:ID>.*?<cbc:EmbeddedDocumentBinaryObject[^>]*>([^<]+)<#s', $cleared, $m)) {
+            db()->prepare("UPDATE invoices SET xml = ?, qr_base64 = ? WHERE id = ?")->execute([$cleared, trim($m[1]), $inv['id']]);
+        }
+    }
+    return ['result' => $result, 'message' => $message, 'status' => $status];
+}
+
+function log_result_badge(string $r): string
+{
+    $map = ['success' => 'success', 'warning' => 'warning text-dark', 'error' => 'danger', 'not_sent' => 'secondary'];
+    return '<span class="badge bg-' . ($map[$r] ?? 'secondary') . '">' . htmlspecialchars(str_replace('_', ' ', $r)) . '</span>';
 }
 
 function seller_settings(): array

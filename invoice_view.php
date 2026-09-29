@@ -15,15 +15,13 @@ $seller = seller_settings();
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'submit') {
     csrf_check();
-    if (setting('zatca_enabled') !== '1' || setting('zatca_production_cert') === '') {
-        flash('ZATCA integration is not configured yet. Add the API configuration and certificate under ZATCA Integration.', 'warning');
-    } else {
-        flash('Submission module is not activated yet. The document is queued as pending.', 'info');
-        $pdo->prepare("UPDATE invoices SET zatca_status = 'pending' WHERE id = ?")->execute([$id]);
-        audit('invoice.queued', $inv['invoice_number']);
-    }
+    $r = zatca_submit_invoice($inv);
+    audit('invoice.submit', ['number' => $inv['invoice_number'], 'result' => $r['result']]);
+    $type = ['success' => 'success', 'warning' => 'warning', 'error' => 'danger', 'not_sent' => 'warning'][$r['result']];
+    flash('ZATCA: ' . $r['message'] . ' See the response log below.', $type);
     header("Location: invoice_view.php?id=$id"); exit;
 }
+$logs = $pdo->prepare("SELECT * FROM zatca_logs WHERE invoice_id = ? ORDER BY id DESC"); $logs->execute([$id]); $logs = $logs->fetchAll();
 
 $isSimplified = $inv['subtype'] === '02';
 $subtotals = [];
@@ -40,12 +38,14 @@ page_header($inv['invoice_number'], 'invoices');
     <a class="btn btn-outline-secondary" href="invoice_form.php?type=381&subtype=<?= $inv['subtype'] ?>&ref=<?= urlencode($inv['invoice_number']) ?>&customer=<?= (int)$inv['customer_id'] ?>"><i class="bi bi-arrow-counterclockwise me-1"></i>Credit note</a>
     <a class="btn btn-outline-secondary" href="invoice_form.php?type=383&subtype=<?= $inv['subtype'] ?>&ref=<?= urlencode($inv['invoice_number']) ?>&customer=<?= (int)$inv['customer_id'] ?>"><i class="bi bi-arrow-clockwise me-1"></i>Debit note</a>
     <?php endif; ?>
+    <?php if (!in_array($inv['zatca_status'], ['cleared', 'reported'], true)): ?>
     <form method="post" class="d-inline"><input type="hidden" name="csrf" value="<?= csrf_token() ?>"><input type="hidden" name="action" value="submit">
       <button class="btn btn-primary"><i class="bi bi-cloud-upload me-1"></i><?= $isSimplified ? 'Report to ZATCA' : 'Clear with ZATCA' ?></button></form>
+    <?php endif; ?>
   </div>
 </div>
 
-<div class="invoice-doc shadow-sm mx-auto">
+<div class="invoice-doc shadow-sm mx-auto" data-bs-theme="light">
   <div class="d-flex justify-content-between align-items-start border-bottom pb-3 mb-3">
     <div>
       <h4><?= h(doc_title($inv)) ?></h4>
@@ -114,6 +114,17 @@ page_header($inv['invoice_number'], 'invoices');
     <div>Invoice hash: <code class="text-break"><?= h($inv['invoice_hash']) ?></code></div>
     <div>Previous hash: <code class="text-break"><?= h($inv['previous_hash']) ?></code></div>
   </div>
+</div>
+
+<div class="card shadow-sm mx-auto mt-3 d-print-none" style="max-width:900px">
+  <div class="card-header bg-white d-flex justify-content-between"><strong><i class="bi bi-journal-text me-1"></i>ZATCA response log</strong><a class="small" href="zatca_logs.php?q=<?= urlencode($inv['invoice_number']) ?>">Open in log viewer</a></div>
+  <div class="table-responsive"><table class="table table-sm mb-0">
+    <thead class="table-light"><tr><th>Time</th><th>Action</th><th>Result</th><th>HTTP</th><th>Message</th><th></th></tr></thead><tbody>
+    <?php if (!$logs): ?><tr><td colspan="6" class="text-center text-muted py-3">No submission attempts yet.</td></tr><?php endif; ?>
+    <?php foreach ($logs as $lg): ?>
+    <tr><td class="text-nowrap small"><?= h($lg['created_at']) ?></td><td><?= h($lg['action']) ?></td><td><?= log_result_badge($lg['result']) ?></td><td><?= h($lg['http_status'] ?? '—') ?></td>
+    <td class="small" style="white-space:pre-line"><?= h(mb_strimwidth((string)$lg['message'], 0, 300, '…')) ?></td><td><a class="btn btn-sm btn-outline-secondary" href="zatca_logs.php?id=<?= $lg['id'] ?>">Details</a></td></tr>
+    <?php endforeach; ?></tbody></table></div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>

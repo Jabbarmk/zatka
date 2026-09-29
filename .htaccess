@@ -1,0 +1,9 @@
+# Block direct access to internal files
+<FilesMatch "\.(md|pdf|xlsx|key|sql|log)$">
+    Require all denied
+</FilesMatch>
+<FilesMatch "^(config|config\.local)\.php$">
+    Require all denied
+</FilesMatch>
+RedirectMatch 403 ^.*/(includes|storage|tools|\.git)/
+Options -Indexes

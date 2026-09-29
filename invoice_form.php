@@ -77,10 +77,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'vat_total' => $totals['vat_total'], 'grand_total' => $totals['grand_total'], 'currency' => 'SAR',
                 'notes' => trim($_POST['notes'] ?? '') ?: null, 'icv' => $icv, 'previous_hash' => $unit['last_hash'],
             ];
-            $xmlNoQr = build_ubl($inv, $lines, $totals, $seller, $customer, null);
-            $hash = invoice_hash($xmlNoQr);
-            $qr = build_qr($inv, $seller, $hash);
+            $qrTags = qr_base_tags($inv, $seller);
+            $hash = invoice_hash(build_ubl($inv, $lines, $totals, $seller, $customer, qr_tlv($qrTags)));
+            $qr = qr_tlv($qrTags + [6 => $hash]);
             $xml = build_ubl($inv, $lines, $totals, $seller, $customer, $qr);
+            if (zatca_signing_ready()) {
+                $signed = zatca_sign_with_settings($xml, $subtype === '02');
+                if ($signed['hash'] !== $hash) throw new RuntimeException('Signing changed the invoice hash.');
+                $xml = $signed['xml']; $qr = $signed['qr'];
+            }
             $inv['invoice_hash'] = $hash; $inv['qr_base64'] = $qr; $inv['xml'] = $xml; $inv['created_by'] = $_SESSION['user_id'];
             $cols = array_keys($inv);
             $pdo->prepare("INSERT INTO invoices (" . implode(',', $cols) . ") VALUES (" . implode(',', array_map(fn($c) => ":$c", $cols)) . ")")->execute($inv);
@@ -91,6 +96,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $pdo->commit();
             audit('invoice.issued', ['id' => $invoiceId, 'number' => $inv['invoice_number'], 'icv' => $icv, 'hash' => $hash]);
             flash('Invoice ' . $inv['invoice_number'] . ' issued.');
+            if (setting('zatca_enabled') === '1' && setting('zatca_auto_submit', '1') === '1') {
+                $r = zatca_submit_invoice($inv + ['id' => $invoiceId, 'zatca_status' => 'not_submitted']);
+                $label = ['success' => 'accepted by ZATCA', 'warning' => 'accepted by ZATCA with warnings', 'error' => 'NOT accepted by ZATCA', 'not_sent' => 'not sent to ZATCA'][$r['result']];
+                flash('Document ' . $label . '. ' . ($r['result'] === 'success' ? '' : $r['message']), ['success' => 'success', 'warning' => 'warning', 'error' => 'danger', 'not_sent' => 'warning'][$r['result']]);
+            }
             header('Location: invoice_view.php?id=' . $invoiceId); exit;
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();
